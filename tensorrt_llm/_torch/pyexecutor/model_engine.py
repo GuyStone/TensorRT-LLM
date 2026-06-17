@@ -1757,7 +1757,16 @@ class PyTorchModelEngine(ModelEngine):
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
-        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata is TrtllmAttentionMetadata else None
+        # Backends that consume the per-beam KV redirection buffer. BEAM_CASCADE uses it
+        # to remap each beam's suffix KV (FlashInfer-dependent, so import is guarded).
+        from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
+        beam_capable_metadata = (TrtllmAttentionMetadata, )
+        if IS_FLASHINFER_AVAILABLE:
+            from ..attention_backend.beam_cascade import \
+                BeamCascadeAttentionMetadata
+            beam_capable_metadata = (TrtllmAttentionMetadata,
+                                     BeamCascadeAttentionMetadata)
+        cache_indirection = self.cache_indirection_attention if self.attn_backend.Metadata in beam_capable_metadata else None
         num_attention_heads = getattr(self.model.model_config.pretrained_config,
                                       'num_attention_heads', None)
         config = self.model.model_config.pretrained_config

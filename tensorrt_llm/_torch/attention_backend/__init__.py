@@ -17,9 +17,12 @@ __all__ = [
 ]
 
 if IS_FLASHINFER_AVAILABLE:
+    from .beam_cascade import (BeamCascadeAttention,
+                               BeamCascadeAttentionMetadata)
     from .flashinfer import FlashInferAttention, FlashInferAttentionMetadata
     from .star_flashinfer import StarAttention, StarAttentionMetadata
     __all__ += [
         "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
-        "StarAttentionMetadata"
+        "StarAttentionMetadata", "BeamCascadeAttention",
+        "BeamCascadeAttentionMetadata"
     ]

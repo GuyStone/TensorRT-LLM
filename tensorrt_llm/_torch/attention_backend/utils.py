@@ -48,6 +48,9 @@ def get_attention_backend(
     elif backend_name == "FLASHINFER_STAR_ATTENTION" and IS_FLASHINFER_AVAILABLE:
         from .star_flashinfer import StarAttention
         return StarAttention
+    elif backend_name == "BEAM_CASCADE" and IS_FLASHINFER_AVAILABLE:
+        from .beam_cascade import BeamCascadeAttention
+        return BeamCascadeAttention
 
     logger.warning("Falling back to TRTLLM attention backend")
     return TrtllmAttention
