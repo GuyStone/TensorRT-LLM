@@ -56,6 +56,31 @@ class AppendLayout:
     batch_indices: torch.Tensor   # [num_gen_queries]  (each new token -> its own seq)
     positions: torch.Tensor       # [num_gen_queries]  (absolute pos = kv_len - 1)
 
+    def to(self, device) -> "AppendLayout":
+        """Move all index tensors to ``device`` (append_paged_kv_cache is CUDA-only)."""
+        return AppendLayout(self.kv_indptr.to(device), self.kv_indices.to(device),
+                            self.last_page_len.to(device),
+                            self.batch_indices.to(device), self.positions.to(device))
+
+
+def per_request_first(flat: List[int],
+                      block_ids_per_beam: List[List[List[int]]]) -> List[int]:
+    """Gather one representative (first-beam) value per request from a beam-flattened,
+    request-major list. Beams of a request share prompt/generated length, so the first
+    beam's value is representative. Handles non-uniform beam widths via a running offset.
+
+    The engine builds ``num_cached_tokens_per_seq`` / ``prompt_lens`` with one entry per
+    (request, beam) (model_engine.py:3342-3345), so they cannot be indexed by request
+    directly.
+    """
+    assert len(flat) == sum(len(b) for b in block_ids_per_beam), (
+        "expected a beam-flattened (request-major) list with one entry per (request, beam)")
+    out, off = [], 0
+    for beams in block_ids_per_beam:
+        out.append(int(flat[off]))
+        off += len(beams)
+    return out
+
 
 def longest_common_prefix_len(beams: List[List[int]]) -> int:
     """Length of the longest common *block-id* prefix across all beams.
@@ -97,6 +122,11 @@ def build_cascade_page_tables(
     block boundary (``prompt_len // page_size``) so it ends on a page boundary — matching
     the allocator's shared/per-beam split (kvCacheManager.cpp:1597, 2217).
     """
+    assert len(prompt_lens) == len(block_ids_per_beam), (
+        "prompt_lens must have exactly one entry per request")
+    assert len(kv_lens_per_beam) == len(block_ids_per_beam), (
+        "kv_lens_per_beam must have exactly one entry per request")
+
     prefix_qo, prefix_kv_indptr, prefix_kv_indices, prefix_last = [0], [0], [], []
     suffix_qo, suffix_kv_indptr, suffix_kv_indices, suffix_last = [0], [0], [], []
 

@@ -57,7 +57,8 @@ import torch
 
 from .beam_cascade_planning import (AppendLayout, CascadePlan,
                                      build_append_layout,
-                                     build_cascade_page_tables)
+                                     build_cascade_page_tables,
+                                     per_request_first)
 from .flashinfer import FlashInferAttention, FlashInferAttentionMetadata
 from .interface import AttentionForwardArgs, merge_attention_forward_args
 
@@ -69,8 +70,10 @@ __all__ = ["BeamCascadeAttention", "BeamCascadeAttentionMetadata"]
 # --------------------------------------------------------------------------- #
 @dataclass(kw_only=True)
 class BeamCascadeAttentionMetadata(FlashInferAttentionMetadata):
-    # Set unconditionally by model_engine.py:3738/3740 (lives on TrtllmAttentionMetadata,
-    # not on the base) — declared here so beam search wires through.
+    # Set by model_engine.py:3747 (=max_beam_width when cache_indirection_buffer/is_warmup)
+    # / 3749 (=1 otherwise), and forced =1 at 2482 on the cuda-graph incremental-update
+    # path. Lives on TrtllmAttentionMetadata, not the base — declared here so beam search
+    # wires through.
     beam_width: int = 1
 
     # Built each decode step in prepare(); consumed by forward(). Not ctor args.
@@ -87,15 +90,25 @@ class BeamCascadeAttentionMetadata(FlashInferAttentionMetadata):
                 and self.num_contexts == 0 and self.kv_cache_manager is not None)
 
     def prepare(self) -> None:
+        # A beam-search generation request co-scheduled with a context request (mixed
+        # batch) cannot go through super().prepare(): the inherited path calls
+        # get_batch_cache_indices() with the default beam_width==1 and asserts one beam
+        # per request (flashinfer.py:766 -> resource_manager.py:1319), which fires on the
+        # beam-gen rows. v1 does not support this; raise clearly rather than crash opaquely.
+        if self.beam_width > 1 and self.num_generations > 0 and self.num_contexts > 0:
+            raise NotImplementedError(
+                "BEAM_CASCADE does not yet support context requests co-scheduled with "
+                "beam-search generation requests (mixed batch). Schedule beam decode "
+                "separately, or use the TRTLLM backend for mixed beam batches.")
         if not self._cascade_applicable():
-            # Prefill / mixed / beam_width==1: standard FlashInfer single-stream path
-            # (also satisfies the inherited beam_width==1 assumption).
+            # Prefill, or beam_width==1 (no beams): standard FlashInfer single-stream path
+            # (its beam_width==1 cache-index assumption holds).
             self._cascade_active = False
             super().prepare()
             return
-        # Beam decode: the inherited prepare() asserts beam_width==1, so build the
+        # Pure beam decode: the inherited prepare() asserts beam_width==1, so build the
         # beam-aware layout directly. Wrappers are planned lazily in forward() (eager v1,
-        # where head/dtype are known and stream is not capturing).
+        # where head/dtype are known and the stream is not capturing).
         self._cascade_active = True
         self._cascade_planned = False
         self._build_beam_decode_tables()
@@ -110,19 +123,25 @@ class BeamCascadeAttentionMetadata(FlashInferAttentionMetadata):
             gen_request_ids, window_size)              # [req][beam] -> [block_id]
         block_ids_per_beam = [[list(beam) for beam in req] for req in raw]
 
+        # num_cached_tokens_per_seq and prompt_lens are beam-FLATTENED (one entry per
+        # (request, beam), request-major; model_engine.py:3342-3345) — they must be
+        # de-strided to per-request values, not indexed by request.
         cached = self.kv_cache_params.num_cached_tokens_per_seq[self.num_contexts:]
-        prompt_lens = (list(self.prompt_lens[self.num_contexts:])
-                       if self.prompt_lens is not None else [int(c) for c in cached])
+        prompts = (self.prompt_lens[self.num_contexts:]
+                   if self.prompt_lens is not None else cached)
+        cached_per_req = per_request_first(cached, block_ids_per_beam)
+        prompt_per_req = per_request_first(prompts, block_ids_per_beam)
         # Beams of a request share prompt + equal generated length; +1 for this step.
-        kv_lens_per_beam = [[int(cached[i]) + 1] * len(beams)
+        kv_lens_per_beam = [[cached_per_req[i] + 1] * len(beams)
                             for i, beams in enumerate(block_ids_per_beam)]
 
         self._cascade_plan = build_cascade_page_tables(block_ids_per_beam,
-                                                       prompt_lens,
+                                                       prompt_per_req,
                                                        kv_lens_per_beam,
                                                        self.page_size)
+        # append_paged_kv_cache is CUDA-only — move the index tensors to the KV device.
         self._append = build_append_layout(block_ids_per_beam, kv_lens_per_beam,
-                                            self.page_size)
+                                            self.page_size).to(self.seq_lens_cuda.device)
         # TODO(CI): remap suffix block selection through cache_indirection
         #   (self.cache_indirection[g][b][prefix_len:kv_len]) for beams that read a
         #   predecessor's KV after reordering. Prefix region is always beam-0
@@ -172,8 +191,10 @@ class BeamCascadeAttentionMetadata(FlashInferAttentionMetadata):
 class BeamCascadeAttention(FlashInferAttention):
     """FlashInfer-based attention with a beam-search cascade decode path.
 
-    Delegates to ``FlashInferAttention`` for prefill / mixed / ``beam_width==1`` and adds
-    the prefix-once + per-beam-suffix + ``merge_state`` path for pure beam-search decode.
+    Delegates to ``FlashInferAttention`` for prefill and for ``beam_width==1`` (no beams),
+    and adds the prefix-once + per-beam-suffix + ``merge_state`` path for pure beam-search
+    decode. Mixed batches (context requests co-scheduled with beam-search generation
+    requests) are not yet supported and raise ``NotImplementedError`` in ``prepare()``.
     """
 
     Metadata = BeamCascadeAttentionMetadata

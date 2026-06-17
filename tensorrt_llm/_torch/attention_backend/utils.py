@@ -49,6 +49,9 @@ def get_attention_backend(
         from .star_flashinfer import StarAttention
         return StarAttention
     elif backend_name == "BEAM_CASCADE" and IS_FLASHINFER_AVAILABLE:
+        if sparse_attention_config is not None:
+            raise ValueError(
+                "BEAM_CASCADE attention backend does not support sparse attention.")
         from .beam_cascade import BeamCascadeAttention
         return BeamCascadeAttention
 

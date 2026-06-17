@@ -393,16 +393,30 @@ beam (loses the bandwidth win and risks divergence).
 - Runs standalone (`python …/test_beam_cascade_parity.py`) or under pytest (with the
   repo's full unit-test env).
 
-### Phase 2 — `BeamCascadeAttention` backend, batch=1 — ~3–5 days
-- Implement `beam_cascade.py` using `MultiLevelCascadeAttentionWrapper(num_levels=2)` for
-  the single-request case (matches the benchmark config).
-- Register `"BEAM_CASCADE"` in `utils.py`; wire `cache_indirection` (§6.2).
-- Prefill delegates to standard paged prefill; only decode uses cascade.
-- Validate end-to-end greedy/beam outputs match the TRTLLM backend on Qwen3-0.6B.
+### Phase 2 — `BeamCascadeAttention` backend — ✅ implemented (engine validation pending CI)
+- `tensorrt_llm/_torch/attention_backend/beam_cascade.py`: `BeamCascadeAttention`
+  (subclasses `FlashInferAttention`) + `BeamCascadeAttentionMetadata`. Delegates to the
+  FlashInfer path for prefill / mixed / `beam_width==1`; the cascade decode path runs the
+  explicit 2× `BatchPrefillWithPagedKVCacheWrapper` + `merge_state` (general / forest, so
+  Phase 3 is folded in). v1 cascade is **eager** (CUDA-graph capture is future work).
+- `tensorrt_llm/_torch/attention_backend/beam_cascade_planning.py`: the pure prefix/suffix
+  page-table split + append layout — **no engine deps**, unit-tested in
+  `test_beam_cascade_split.py` (incl. the lossless multi-block suffix that
+  `_pack_beam_cache_indices` truncates).
+- Registered `"BEAM_CASCADE"` in `utils.py` + `attention_backend/__init__.py`; broadened
+  the `model_engine.py` `cache_indirection` gate to pass the per-beam buffer to the new
+  metadata type.
+- Key constraint handled: the inherited `FlashInferAttentionMetadata.prepare()` assumes
+  `beam_width==1`, so the beam path builds its KV layout from the lossless
+  `impl.get_batch_cache_block_ids`.
+- **Pending CI** (§7 items 5-8, needs a built engine + model): end-to-end beam outputs vs
+  the TRTLLM backend, `cache_indirection` suffix remap on beam reorder, the
+  (request, beam) query-ordering assumption, and CUDA-graph capture.
 
-### Phase 3 — Batched (forest) support — ~3 days
-- Replace the single-tree wrapper with explicit two-pass + `merge_state` for `batch > 1`.
-- Per-request prefix levels; per-beam suffix levels with predecessor remap.
+### Phase 3 — Batched (forest) support — ✅ folded into Phase 2
+- The cascade path uses the explicit two-pass + `merge_state` (not the single-tree
+  wrapper), so multiple requests with different prefixes / beam widths / suffix lengths
+  work; validated in `test_beam_cascade_paged.py::test_two_pass_forest_heterogeneous`.
 
 ### Phase 4 — Benchmark & tune — ~2 days
 - Add `BEAM_CASCADE` as a variant in `lpm-benchmark/engines/trtllm/run_benchmark.sh`

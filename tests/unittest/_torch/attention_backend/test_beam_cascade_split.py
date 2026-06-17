@@ -111,6 +111,40 @@ def test_forest_multiple_requests():
     assert len(p.suffix_kv_indptr) == p.num_gen_queries + 1
 
 
+def test_per_request_first_destrides():
+    # beam-flattened, request-major: req0 has 2 beams, req1 has 3 beams.
+    block_ids = [[[1], [2]], [[3], [4], [5]]]
+    flat = [100, 100, 250, 250, 250]   # one cached-len entry per (request, beam)
+    assert bcp.per_request_first(flat, block_ids) == [100, 250]
+
+
+def test_per_request_first_rejects_wrong_length():
+    block_ids = [[[1], [2]]]           # 1 request, 2 beams -> expects 2 flat entries
+    try:
+        bcp.per_request_first([5], block_ids)
+    except AssertionError:
+        return
+    raise AssertionError("expected an AssertionError on a non-beam-flattened list")
+
+
+def test_build_cascade_rejects_mismatched_prompt_lens():
+    beams = [[[10], [11]]]             # 1 request
+    try:
+        bcp.build_cascade_page_tables(beams, [4, 8], [[5, 5]], 4)  # 2 prompt_lens
+    except AssertionError:
+        return
+    raise AssertionError("expected an AssertionError on per-request length mismatch")
+
+
+def test_append_layout_moves_to_device():
+    page = 4
+    beams = [[[10, 11, 12], [10, 11, 13]]]
+    a = bcp.build_append_layout(beams, [[11, 11]], page)
+    moved = a.to("cpu")  # device-agnostic smoke test of the .to() plumbing
+    assert moved.kv_indices.tolist() == a.kv_indices.tolist()
+    assert str(moved.batch_indices.device) == "cpu"
+
+
 def test_append_layout():
     page = 4
     beams = [[[10, 11, 12], [10, 11, 13]]]
